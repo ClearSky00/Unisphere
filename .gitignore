@@ -1,0 +1,41 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+.next
+node_modules
+dist
+dist-ssr
+*.local
+.env
+*.env
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.exe
+
+# Junk / temp files
+.fuse_hidden*
+FIND_ME_DELETE_THIS.txt
+cookies.txt
+.env.local.save
+edited/
+/1.png
+/2.png
+/3.png
+NoteDiff_File_Catalog.xlsx
+University_Application_Deadlines_2027.docx
+linkedin-post-visual.html
+uni_selector_visual.html
+unisphere-performance-report.html

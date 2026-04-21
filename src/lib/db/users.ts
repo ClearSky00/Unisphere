@@ -1,0 +1,887 @@
+import { createRouteHandlerClientWithCookies } from './client';
+import { createAnonymousClient } from '@/utils/supabase/client';
+import { AuthUser, withAuth } from '../auth/protectResource';
+import { securityCheck, verifyUserPermission } from './securityUtils';
+
+// Define interfaces
+export interface UserBasic {
+  id: string;
+  email: string;
+  is_tutor: boolean;
+}
+
+export interface UserProfile {
+  id: string;
+  email?: string;
+  first_name?: string;
+  last_name?: string;
+  bio?: string;
+  avatar_url?: string;
+  is_tutor: boolean;
+  tokens?: number;
+  subjects?: string;
+  has_access?: boolean;
+  survey_completed?: boolean;
+  
+  // Student profile fields
+  intended_universities?: string;
+  intended_major?: string;
+  current_subjects?: string[] | string;
+  year?: string;
+  school_name?: string;
+  previous_schools?: string[] | string;
+  age?: string;
+  
+  // Examination records
+  a_levels?: any[];
+  ib_diploma?: any[];
+  igcse?: any[];
+  spm?: any[];
+  
+  // Activities and achievements
+  extracurricular_activities?: any[];
+  awards?: any[];
+  
+  // University planning fields
+  application_cycle?: string;
+  countries_to_apply?: string;
+  universities_to_apply?: string;
+  planned_admissions_tests?: string;
+  completed_admissions_tests?: string;
+  planned_admissions_support?: string;
+  university_other_info?: string;
+}
+
+// Fields for basic user info
+const USER_BASIC_FIELDS = `
+  id, email, is_tutor
+`;
+
+/**
+ * Search for users based on query
+ */
+async function _searchUsers(authUser: AuthUser, query: string): Promise<{
+  users: UserBasic[];
+  error: string | null;
+}> {
+  try {
+    // Extra security check - verify authenticated user
+    const securityError = securityCheck(authUser);
+    if (securityError) {
+      return { users: [], error: securityError };
+    }
+    
+    if (!query || query.trim().length < 2) {
+      return { users: [], error: null }; // Return empty array for very short queries
+    }
+    
+    // Create a server client for this request
+    const client = await createRouteHandlerClientWithCookies();
+    
+    // Search across users
+    const { data, error } = await client
+      .from('users')
+      .select(USER_BASIC_FIELDS)
+      .ilike('email', `%${query}%`)
+      .limit(20);
+      
+    if (error) {
+      return { users: [], error: error.message };
+    }
+    
+    return { users: data || [], error: null };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return { users: [], error: errorMessage };
+  }
+}
+
+// Export the authenticated version
+export const searchUsers = withAuth(_searchUsers);
+
+/**
+ * Get a user by ID
+ */
+async function _getUserById(authUser: AuthUser, userId: string): Promise<{
+  user: UserProfile | null;
+  error: string | null;
+}> {
+  try {
+    // Extra security check - verify authenticated user
+    const securityError = securityCheck(authUser);
+    if (securityError) {
+      return { user: null, error: securityError };
+    }
+    
+    if (!userId) {
+      return { user: null, error: 'User ID is required' };
+    }
+    
+    // Only allow users to access their own profiles, unless they're an admin
+    // (You could add a check for admin role here)
+    if (authUser.id !== userId) {
+      // Only allow basic info to be returned for other users
+      return await getPublicUserById(userId);
+    }
+    
+    // Create a server client for this request
+    const client = await createRouteHandlerClientWithCookies();
+    
+    // Get user data
+    const { data, error } = await client
+      .from('users')
+      .select('id, email, is_tutor, created_at, last_sign_in, email_confirmed_at')
+      .eq('id', userId)
+      .single();
+      
+    if (error) {
+      return { user: null, error: 'User not found' };
+    }
+    
+    return { user: data, error: null };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return { user: null, error: errorMessage };
+  }
+}
+
+// Export the authenticated version
+export const getUserById = withAuth(_getUserById);
+
+/**
+ * Get the user profile for the current user or a specific user ID
+ * @param userId User ID to fetch profile for
+ * @param currentUser The currently authenticated user (for permission checking)
+ */
+export async function getUserProfile(
+  userId: string,
+  currentUser?: AuthUser
+): Promise<{ user: UserProfile | null; error: string | null }> {
+  try {
+    // Use currentUser to properly handle permissions
+    const supabase = await createRouteHandlerClientWithCookies();
+    
+    // If the client is not properly initialized 
+    if (supabase.from && typeof supabase.from !== 'function') {
+      return { user: null, error: 'Database client error' };
+    }
+    
+    // If requesting another user's profile, do permission check
+    if (currentUser && userId !== currentUser.id) {
+      const permissionError = await verifyUserPermission(currentUser, userId);
+      if (permissionError) {
+        return { user: null, error: 'Permission denied' };
+      }
+    }
+    
+    try {
+      // Fetch user data, tutor profile, and student profile in parallel
+      // to avoid sequential database round-trips
+      const [userResult, tutorResult, studentResult] = await Promise.all([
+        supabase.from('users').select('id, email, is_tutor, tokens, has_access').eq('id', userId).single(),
+        supabase.from('tutor_profile').select('*').eq('id', userId).single(),
+        supabase.from('student_profile').select('*').eq('id', userId).single(),
+      ]);
+
+      const userData = userResult.data;
+      if (userResult.error) {
+        return { user: null, error: 'Failed to fetch user data' };
+      }
+
+      if (tutorResult.data) {
+        return {
+          user: {
+            ...tutorResult.data,
+            tokens: userData?.tokens || 0,
+            has_access: userData?.has_access || false,
+            survey_completed: tutorResult.data?.survey_completed || false,
+            is_tutor: true
+          },
+          error: null
+        };
+      }
+
+      if (studentResult.data) {
+        return {
+          user: {
+            ...studentResult.data,
+            tokens: userData?.tokens || 0,
+            has_access: userData?.has_access || false,
+            survey_completed: studentResult.data?.survey_completed || false,
+            is_tutor: false
+          },
+          error: null
+        };
+      }
+
+      // If not found in either table, return basic user data
+      return {
+        user: userData ? {
+          ...userData,
+          has_access: userData.has_access || false,
+          survey_completed: false,
+          is_tutor: userData.is_tutor || false
+        } : null,
+        error: userData ? null : 'User profile not found'
+      };
+    } catch (dbError) {
+      return { user: null, error: 'Database query error' };
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error fetching user profile';
+    return { user: null, error: errorMessage };
+  }
+}
+
+/**
+ * Check if a user exists and what type they are (tutor or student)
+ * This is a public route that doesn't require authentication
+ */
+export async function checkUserExists(userId: string): Promise<{ 
+  exists: boolean; 
+  isStudent: boolean;
+  isTutor: boolean;
+  error: string | null;
+}> {
+  try {
+    const supabase = createAnonymousClient();
+
+    // Check both profile tables in parallel
+    const [tutorResult, studentResult] = await Promise.all([
+      supabase.from('tutor_profile').select('id').eq('id', userId).single(),
+      supabase.from('student_profile').select('id').eq('id', userId).single(),
+    ]);
+
+    if (tutorResult.data) {
+      return { exists: true, isStudent: false, isTutor: true, error: null };
+    }
+
+    if (studentResult.data) {
+      return { exists: true, isStudent: true, isTutor: false, error: null };
+    }
+
+    // Not found in either table
+    return { exists: false, isStudent: false, isTutor: false, error: 'User not found' };
+  } catch (error) {
+    return { 
+      exists: false, 
+      isStudent: false, 
+      isTutor: false, 
+      error: error instanceof Error ? error.message : 'Unknown error checking user' 
+    };
+  }
+}
+
+/**
+ * Get public user by ID
+ */
+export async function getPublicUserById(userId: string): Promise<{
+  user: UserProfile | null;
+  error: string | null;
+}> {
+  try {
+    if (!userId) {
+      return { user: null, error: 'User ID is required' };
+    }
+    
+    // Create a server client for this request
+    const client = await createRouteHandlerClientWithCookies();
+    
+    // Get user data with limited public fields
+    const { data, error } = await client
+      .from('users')
+      .select('id, email, is_tutor')
+      .eq('id', userId)
+      .single();
+      
+    if (error) {
+      return { user: null, error: 'User not found' };
+    }
+    
+    return { user: data, error: null };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return { user: null, error: errorMessage };
+  }
+} 
+
+/**
+ * Create a user profile if one doesn't exist
+ * This should be called after the user is authenticated
+ */
+export async function createUserProfileIfNeeded(
+  userId: string,
+  userData: { 
+    is_tutor: boolean;
+    first_name?: string;
+    last_name?: string;
+    email?: string;
+  }
+): Promise<{
+  success: boolean;
+  error: string | null;
+}> {
+  try {
+    if (!userId) {
+      return { success: false, error: 'User ID is required' };
+    }
+
+    // Create a server client for this request
+    const supabase = await createRouteHandlerClientWithCookies();
+    
+    // Check if profile already exists
+    const { exists, isStudent, isTutor } = await checkUserExists(userId);
+    
+    // If profile exists, nothing to do
+    if (exists) {
+      return { success: true, error: null };
+    }
+    
+    // Otherwise, create the appropriate profile
+    if (userData.is_tutor) {
+      // For tutors, we create a minimal profile
+      // They'll complete the rest of their profile in the onboarding flow
+      const { error } = await supabase
+        .from('tutor_profile')
+        .insert({
+          id: userId,
+          first_name: userData.first_name || userData.email?.split('@')[0] || 'Tutor',
+          last_name: userData.last_name || '',
+          description: ''
+        });
+      
+      if (error) {
+        // Duplicate key violation (23505) should be treated as a success
+        // This can happen due to race conditions when profile is created in parallel
+        if (error.code === '23505') {
+          return { success: true, error: null };
+        }
+        
+        return { success: false, error: error.message };
+      }
+    } else {
+      // Create student profile
+      const { error } = await supabase
+        .from('student_profile')
+        .insert({
+          id: userId,
+          first_name: userData.first_name || userData.email?.split('@')[0] || 'Student',
+          last_name: userData.last_name || ''
+        });
+      
+      if (error) {
+        // Duplicate key violation (23505) should be treated as a success
+        // This can happen due to race conditions when profile is created in parallel
+        if (error.code === '23505') {
+          return { success: true, error: null };
+        }
+        
+        return { success: false, error: error.message };
+      }
+    }
+    
+    return { success: true, error: null };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return { success: false, error: errorMessage };
+  }
+} 
+
+export async function getUserProfileById(
+  userId: string, 
+  authUser: AuthUser,
+  options?: {
+    profile_type?: 'student' | 'tutor';
+    complete?: boolean;
+  }
+): Promise<{
+  profile: any;
+  error: string | null;
+}> {
+  try {
+    // For security, users can only access their own profile unless they have elevated permissions
+    if (userId !== authUser.id && !authUser.is_tutor) {  // Assuming tutors can view student profiles
+      return { profile: null, error: 'Access denied' };
+    }
+    
+    const supabase = await createRouteHandlerClientWithCookies();
+    
+    // If profile_type is specified, use that directly without checking user role
+    if (options?.profile_type) {
+      // For security, only allow tutors to directly request student profiles
+      if (options.profile_type === 'student' && !authUser.is_tutor) {
+        return { profile: null, error: 'Access denied' };
+      }
+      
+      const profileTable = options.profile_type === 'tutor' ? 'tutor_profile' : 'student_profile';
+      
+      const { data: profileData, error: profileError } = await supabase
+        .from(profileTable)
+        .select('*')
+        .eq('id', userId)
+        .single();
+      
+      if (profileError) {
+        return { profile: null, error: `${options.profile_type} profile not found` };
+      }
+      
+      return { profile: profileData, error: null };
+    }
+    
+    // For regular profile requests, check user role first
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('id, is_tutor')
+      .eq('id', userId)
+      .single();
+      
+    if (userError || !userData) {
+      return { profile: null, error: 'User not found' };
+    }
+    
+    // Fetch profile based on user role
+    const isTutor = userData.is_tutor;
+    const profileTable = isTutor ? 'tutor_profile' : 'student_profile';
+    
+    const { data: profileData, error: profileError } = await supabase
+      .from(profileTable)
+      .select('*')
+      .eq('id', userId)
+      .single();
+    
+    if (profileError) {
+      return { profile: null, error: 'Profile not found' };
+    }
+    
+    return { profile: profileData, error: null };
+  } catch (error) {
+    return { profile: null, error: 'Internal server error' };
+  }
+} 
+
+export async function updateUserProfile(
+  userId: string,
+  authUser: AuthUser,
+  updateData: Record<string, any>
+): Promise<{
+  profile: any;
+  error: string | null;
+}> {
+  try {
+    // For security, users can only update their own profile
+    if (userId !== authUser.id) {
+      return { profile: null, error: 'Access denied' };
+    }
+    
+    const supabase = await createRouteHandlerClientWithCookies();
+    
+    // First check if user exists and get their role
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('is_tutor')
+      .eq('id', userId)
+      .single();
+      
+    if (userError) {
+      console.error('Error fetching user role:', userError);
+      return { profile: null, error: 'User not found' };
+    }
+    
+    if (!userData) {
+      return { profile: null, error: 'User not found' };
+    }
+    
+    // Define allowed fields based on role
+    const isTutor = userData.is_tutor;
+    let profileTable = isTutor ? 'tutor_profile' : 'student_profile';
+    let filteredUpdateData: Record<string, any> = {};
+    
+    // Detailed logging
+    
+    // Filter fields based on role
+    if (isTutor) {
+      // Tutor profile fields that can be updated
+      if (updateData.first_name !== undefined) filteredUpdateData.first_name = updateData.first_name;
+      if (updateData.last_name !== undefined) filteredUpdateData.last_name = updateData.last_name;
+      if (updateData.age !== undefined) filteredUpdateData.age = updateData.age;
+      if (updateData.cost !== undefined) filteredUpdateData.cost = updateData.cost;
+      if (updateData.service_costs !== undefined) {
+        filteredUpdateData.service_costs = safeJSONField(updateData.service_costs);
+      }
+      if (updateData.bio !== undefined) filteredUpdateData.description = updateData.bio;
+      if (updateData.description !== undefined) filteredUpdateData.description = updateData.description;
+      if (updateData.avatar_url !== undefined) filteredUpdateData.avatar_url = updateData.avatar_url;
+      if (updateData.subjects !== undefined) filteredUpdateData.subjects = updateData.subjects;
+    } else {
+      // Student profile fields that can be updated
+      try {
+        // Basic fields
+        if (updateData.first_name !== undefined) filteredUpdateData.first_name = updateData.first_name;
+        if (updateData.last_name !== undefined) filteredUpdateData.last_name = updateData.last_name;
+        if (updateData.avatar_url !== undefined) filteredUpdateData.avatar_url = updateData.avatar_url;
+        if (updateData.intended_universities !== undefined) filteredUpdateData.intended_universities = updateData.intended_universities;
+        if (updateData.intended_major !== undefined) filteredUpdateData.intended_major = updateData.intended_major;
+        if (updateData.high_school_subjects !== undefined) filteredUpdateData.current_subjects = updateData.high_school_subjects;
+        if (updateData.current_subjects !== undefined) filteredUpdateData.current_subjects = updateData.current_subjects;
+        if (updateData.bio !== undefined) filteredUpdateData.bio = updateData.bio;
+        
+        // Process JSON fields with detailed logging
+        
+        // New examination record fields
+        if (updateData.a_levels !== undefined) {
+          filteredUpdateData.a_levels = safeJSONField(updateData.a_levels);
+        }
+        
+        if (updateData.ib_diploma !== undefined) {
+          filteredUpdateData.ib_diploma = safeJSONField(updateData.ib_diploma);
+        }
+        
+        if (updateData.igcse !== undefined) {
+          filteredUpdateData.igcse = safeJSONField(updateData.igcse);
+        }
+        
+        if (updateData.spm !== undefined) {
+          filteredUpdateData.spm = safeJSONField(updateData.spm);
+        }
+        
+        // Extracurricular activities and awards
+        if (updateData.extracurricular_activities !== undefined) {
+          filteredUpdateData.extracurricular_activities = safeJSONField(updateData.extracurricular_activities);
+        }
+        
+        if (updateData.awards !== undefined) {
+          filteredUpdateData.awards = safeJSONField(updateData.awards);
+        }
+        
+        // University planning fields
+        if (updateData.application_cycle !== undefined) filteredUpdateData.application_cycle = updateData.application_cycle;
+        if (updateData.countries_to_apply !== undefined) filteredUpdateData.countries_to_apply = updateData.countries_to_apply;
+        if (updateData.universities_to_apply !== undefined) filteredUpdateData.universities_to_apply = updateData.universities_to_apply;
+        if (updateData.planned_admissions_tests !== undefined) filteredUpdateData.planned_admissions_tests = updateData.planned_admissions_tests;
+        if (updateData.completed_admissions_tests !== undefined) filteredUpdateData.completed_admissions_tests = updateData.completed_admissions_tests;
+        if (updateData.planned_admissions_support !== undefined) filteredUpdateData.planned_admissions_support = updateData.planned_admissions_support;
+        if (updateData.university_other_info !== undefined) filteredUpdateData.university_other_info = updateData.university_other_info;
+        
+        // Other student fields
+        if (updateData.age !== undefined) filteredUpdateData.age = updateData.age;
+        if (updateData.year !== undefined) filteredUpdateData.year = updateData.year;
+        if (updateData.school_name !== undefined) filteredUpdateData.school_name = updateData.school_name;
+        if (updateData.previous_schools !== undefined) filteredUpdateData.previous_schools = updateData.previous_schools;
+        if (updateData.country !== undefined) filteredUpdateData.country = updateData.country;
+        if (updateData.gender !== undefined) filteredUpdateData.gender = updateData.gender;
+        if (updateData.nationality !== undefined) filteredUpdateData.nationality = updateData.nationality;
+        if (updateData.phone_number !== undefined) filteredUpdateData.phone_number = updateData.phone_number;
+        if (updateData.address !== undefined) filteredUpdateData.address = updateData.address;
+        if (updateData.postal_code !== undefined) filteredUpdateData.postal_code = updateData.postal_code;
+        if (updateData.city !== undefined) filteredUpdateData.city = updateData.city;
+        if (updateData.parent_name !== undefined) filteredUpdateData.parent_name = updateData.parent_name;
+        if (updateData.parent_email !== undefined) filteredUpdateData.parent_email = updateData.parent_email;
+        if (updateData.education_level !== undefined) filteredUpdateData.education_level = updateData.education_level;
+        if (updateData.graduation_year !== undefined) filteredUpdateData.graduation_year = updateData.graduation_year;
+        if (updateData.academic_achievements !== undefined) filteredUpdateData.academic_achievements = updateData.academic_achievements;
+        if (updateData.learning_style !== undefined) filteredUpdateData.learning_style = updateData.learning_style;
+        if (updateData.study_habits !== undefined) filteredUpdateData.study_habits = updateData.study_habits;
+        if (updateData.learning_challenges !== undefined) filteredUpdateData.learning_challenges = updateData.learning_challenges;
+        if (updateData.career_goals !== undefined) filteredUpdateData.career_goals = updateData.career_goals;
+      } catch (error) {
+        console.error('Error processing student profile fields:', error);
+        return { profile: null, error: `Error processing fields: ${error instanceof Error ? error.message : String(error)}` };
+      }
+    }
+    
+    // Only proceed if there are fields to update
+    if (Object.keys(filteredUpdateData).length === 0) {
+      return { profile: null, error: 'No valid fields to update' };
+    }
+    
+    // Log the final filtered data
+    
+    // Update the profile
+    const { data, error } = await supabase
+      .from(profileTable)
+      .update(filteredUpdateData)
+      .eq('id', userId)
+      .select('*')
+      .single();
+    
+    if (error) {
+      console.error('Database error when updating profile:', error);
+      return { profile: null, error: `Database error: ${error.message}` };
+    }
+    
+    return { profile: data, error: null };
+  } catch (error) {
+    console.error('Uncaught error in updateUserProfile:', error);
+    return { profile: null, error: `Internal server error: ${error instanceof Error ? error.message : String(error)}` };
+  }
+} 
+
+// Safely handle JSONB field - returns null for empty/invalid data
+const safeJSONField = (data: any): any | null => {
+  if (data === null || data === undefined) return null;
+  
+  // If it's a string, try to parse it
+  if (typeof data === 'string') {
+    if (data.trim() === '') return null;
+    try {
+      const parsed = JSON.parse(data);
+      // Return null for empty arrays
+      if (Array.isArray(parsed) && parsed.length === 0) return null;
+      return parsed;
+    } catch (e) {
+      console.error('Error parsing JSON:', e);
+      return null;
+    }
+  }
+  
+  // If it's already an array, check if it's empty
+  if (Array.isArray(data) && data.length === 0) return null;
+  
+  return data;
+}; 
+
+
+// Update survey completion in the profile table (instead of users table to avoid RLS issues)
+export async function updateSurveyCompletionInProfile(userId: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    const supabase = await createRouteHandlerClientWithCookies();
+    if (!supabase) {
+      return { success: false, error: 'Failed to create Supabase client' };
+    }
+
+    // First, get the user to check if they're a tutor or student
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('is_tutor')
+      .eq('id', userId)
+      .single();
+
+    if (userError) {
+      console.error('Error fetching user:', userError);
+      return { success: false, error: userError.message };
+    }
+
+    // Determine which profile table to update
+    const profileTable = user.is_tutor ? 'tutor_profile' : 'student_profile';
+
+    // Update the survey_completed field in the appropriate profile table
+    const { error: updateError } = await supabase
+      .from(profileTable)
+      .update({ survey_completed: true })
+      .eq('id', userId);
+
+    if (updateError) {
+      console.error(`Error updating ${profileTable}:`, updateError);
+      return { success: false, error: updateError.message };
+    }
+
+    return { success: true };
+
+  } catch (error) {
+    console.error('Error updating survey completion in profile:', error);
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+// Save survey responses to the survey_responses table
+export async function saveSurveyResponses(userId: string, surveyData: {
+  region: string;
+  applicationCycle: string;
+  universities: string[];
+  services: string[];
+  country: string;
+  school: string;
+  course: string;
+}): Promise<{ success: boolean; error?: string }> {
+  try {
+    const supabase = await createRouteHandlerClientWithCookies();
+    if (!supabase) {
+      return { success: false, error: 'Failed to create Supabase client' };
+    }
+
+
+    // Get user's name from the appropriate profile table
+    let userName = 'Unknown User';
+    try {
+      // First get user type
+      const { data: userData, error: userError } = await supabase
+        .from('users')
+        .select('is_tutor')
+        .eq('id', userId)
+        .single();
+
+      if (userData && !userError) {
+        if (userData.is_tutor) {
+          // Get name from tutor_profile
+          const { data: tutorProfile, error: tutorError } = await supabase
+            .from('tutor_profile')
+            .select('first_name, last_name')
+            .eq('id', userId)
+            .single();
+
+          if (tutorProfile && !tutorError) {
+            const firstName = tutorProfile.first_name || '';
+            const lastName = tutorProfile.last_name || '';
+            userName = `${firstName} ${lastName}`.trim() || 'Unknown User';
+          }
+        } else {
+          // Get name from student_profile
+          const { data: studentProfile, error: studentError } = await supabase
+            .from('student_profile')
+            .select('first_name, last_name')
+            .eq('id', userId)
+            .single();
+
+          if (studentProfile && !studentError) {
+            const firstName = studentProfile.first_name || '';
+            const lastName = studentProfile.last_name || '';
+            userName = `${firstName} ${lastName}`.trim() || 'Unknown User';
+          }
+        }
+      }
+    } catch (nameError) {
+      console.warn('Could not fetch user name for survey response:', nameError);
+      // userName remains 'Unknown User'
+    }
+
+    // Prepare the data for insertion
+    const surveyResponse = {
+      user_id: userId,
+      name: userName,
+      region: surveyData.region,
+      application_cycle: surveyData.applicationCycle,
+      universities: surveyData.universities, // Array will be stored as JSON
+      services: surveyData.services, // Array will be stored as JSON
+      country: surveyData.country,
+      school: surveyData.school,
+      course: surveyData.course,
+    };
+
+    // Insert the survey response
+    const { error: insertError } = await supabase
+      .from('survey_responses')
+      .insert(surveyResponse);
+
+    if (insertError) {
+      console.error('Error saving survey responses:', insertError);
+      return { success: false, error: insertError.message };
+    }
+
+    return { success: true };
+
+  } catch (error) {
+    console.error('Error saving survey responses:', error);
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+// Sync survey answers into the student_profile table so tutors see them on the profile.
+// Only overwrites a field if the profile doesn't already have a value for it,
+// except for countries_to_apply / application_cycle which we always set from the survey.
+export async function syncSurveyToStudentProfile(userId: string, surveyData: {
+  region: string;
+  applicationCycle: string;
+  universities: string[];
+  services: string[];
+  country: string;
+  school: string;
+  course: string;
+}): Promise<{ success: boolean; error?: string }> {
+  try {
+    const supabase = await createRouteHandlerClientWithCookies();
+    if (!supabase) {
+      return { success: false, error: 'Failed to create Supabase client' };
+    }
+
+    // Fetch current profile so we don't stomp on data the student already filled in
+    const { data: existing } = await supabase
+      .from('student_profile')
+      .select('school_name, intended_major, country, countries_to_apply, application_cycle')
+      .eq('id', userId)
+      .single();
+
+    const update: Record<string, any> = {};
+
+    // Always sync these - they are the core outputs of the survey
+    if (surveyData.region) {
+      update.countries_to_apply = surveyData.region;
+    }
+    if (surveyData.applicationCycle) {
+      update.application_cycle = surveyData.applicationCycle;
+    }
+
+    // Sync universities list as JSON (always - it's the primary survey data)
+    if (surveyData.universities && surveyData.universities.length > 0) {
+      update.universities_to_apply = JSON.stringify(surveyData.universities);
+    }
+
+    // Sync services (maps to planned_admissions_support) - always sync
+    if (surveyData.services && surveyData.services.length > 0) {
+      update.planned_admissions_support = JSON.stringify(surveyData.services);
+    }
+
+    // Only fill in school_name / intended_major / country if blank
+    if (surveyData.school && !existing?.school_name) {
+      update.school_name = surveyData.school;
+    }
+    if (surveyData.course && !existing?.intended_major) {
+      update.intended_major = surveyData.course;
+    }
+    if (surveyData.country && !existing?.country) {
+      update.country = surveyData.country;
+    }
+
+    if (Object.keys(update).length === 0) {
+      return { success: true };
+    }
+
+    const { error: updateError } = await supabase
+      .from('student_profile')
+      .update(update)
+      .eq('id', userId);
+
+    if (updateError) {
+      console.error('Error syncing survey to student_profile:', updateError);
+      return { success: false, error: updateError.message };
+    }
+
+    return { success: true };
+  } catch (error) {
+    console.error('Error in syncSurveyToStudentProfile:', error);
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+// Get survey responses for a user
+export async function getSurveyResponses(userId: string): Promise<{
+  responses: any | null;
+  error?: string
+}> {
+  try {
+    const supabase = await createRouteHandlerClientWithCookies();
+    if (!supabase) {
+      return { responses: null, error: 'Failed to create Supabase client' };
+    }
+
+    const { data, error } = await supabase
+      .from('survey_responses')
+      .select('*')
+      .eq('user_id', userId)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        // No rows found
+        return { responses: null, error: 'No survey responses found' };
+      }
+      console.error('Error fetching survey responses:', error);
+      return { responses: null, error: error.message };
+    }
+
+    return { responses: data, error: undefined };
+
+  } catch (error) {
+    console.error('Error fetching survey responses:', error);
+    return { responses: null, error: error instanceof Error ? error.message : String(error) };
+  }
+}
